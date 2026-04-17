@@ -77,7 +77,7 @@ router.get('/feed', authenticate, async (req, res) => {
       username: photo.username,
       caption: photo.caption,
       created_at: photo.created_at,
-      url: `http://localhost:${process.env.PORT}/uploads/${photo.filename}`
+      url: `http://localhost/uploads/${photo.filename}`
     }));
 
     res.status(200).json({ photos });
