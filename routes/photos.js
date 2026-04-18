@@ -3,6 +3,7 @@ import multer from 'multer';
 import path from 'path';
 import { masterDb, slaveDb } from '../db.js';
 import authenticate from '../middleware/auth.js';
+import redis from '../redis.js';
 
 const router = express.Router();
 
@@ -46,12 +47,16 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
       [req.user.id, req.file.filename, caption || null]
     );
 
+    // Invalidate feed cache so next request gets fresh data
+    await redis.del('feed');
+    await redis.del(`user:${req.user.id}:photos`);
+
     res.status(201).json({ 
       message: 'Photo uploaded successfully',
       photo: {
         filename: req.file.filename,
         caption: caption || null,
-        url: `http://localhost:${process.env.PORT}/uploads/${req.file.filename}`
+        url: `http://localhost/uploads/${req.file.filename}`
       }
     });
   } catch (error) {
@@ -63,7 +68,16 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
 // GET ALL PHOTOS (feed)
 router.get('/feed', authenticate, async (req, res) => {
   try {
-    // Read → slave
+    // Check Redis first
+    const cached = await redis.get('feed');
+    if (cached) {
+      return res.status(200).json({ 
+        photos: JSON.parse(cached),
+        source: 'cache'
+      });
+    }
+
+    // Cache MISS - query the slave database
     const [rows] = await slaveDb.query(
       `SELECT photos.id, photos.filename, photos.caption, photos.created_at,
               users.username
@@ -80,7 +94,10 @@ router.get('/feed', authenticate, async (req, res) => {
       url: `http://localhost/uploads/${photo.filename}`
     }));
 
-    res.status(200).json({ photos });
+    // Store in Redis with 30 second TTL
+    await redis.set('feed', JSON.stringify(photos), 'EX', 30);
+
+    res.status(200).json({ photos, source: 'database' });
   } catch (error) {
     console.error('Feed error:', error);
     res.status(500).json({ error: 'Something went wrong' });
@@ -90,7 +107,18 @@ router.get('/feed', authenticate, async (req, res) => {
 // GET MY PHOTOS
 router.get('/my-photos', authenticate, async (req, res) => {
   try {
-    // Read → slave
+    const cacheKey = `user:${req.user.id}:photos`;
+
+    // Check Redis first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({ 
+        photos: JSON.parse(cached),
+        source: 'cache'
+      });
+    }
+
+    // Cache MISS - query the slave database
     const [rows] = await slaveDb.query(
       'SELECT * FROM photos WHERE user_id = ? ORDER BY created_at DESC',
       [req.user.id]
@@ -100,10 +128,13 @@ router.get('/my-photos', authenticate, async (req, res) => {
       id: photo.id,
       caption: photo.caption,
       created_at: photo.created_at,
-      url: `http://localhost:${process.env.PORT}/uploads/${photo.filename}`
+      url: `http://localhost/uploads/${photo.filename}`
     }));
 
-    res.status(200).json({ photos });
+    // Store in Redis with 30 second TTL
+    await redis.set(cacheKey, JSON.stringify(photos), 'EX', 30);
+
+    res.status(200).json({ photos, source: 'database' });
   } catch (error) {
     console.error('My photos error:', error);
     res.status(500).json({ error: 'Something went wrong' });
