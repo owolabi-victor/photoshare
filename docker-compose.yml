@@ -42,9 +42,10 @@ services:
     networks:
       - photoshare-network
 
-  app1:
+  # US Data Center
+  us-app1:
     build: .
-    container_name: photoshare-app1
+    container_name: photoshare-us-app1
     environment:
       DB_SHARD0_HOST: db-shard0
       DB_SHARD1_HOST: db-shard1
@@ -53,6 +54,7 @@ services:
       DB_NAME: photoshare
       SESSION_SECRET: "xK9mL2pQ8vN4rW7zJ1yU6tA3sF0gH5d"
       PORT: 3000
+      REGION: us-east
       REDIS_HOST: redis
       REDIS_PORT: 6379
       RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
@@ -64,9 +66,9 @@ services:
     networks:
       - photoshare-network
 
-  app2:
+  us-app2:
     build: .
-    container_name: photoshare-app2
+    container_name: photoshare-us-app2
     environment:
       DB_SHARD0_HOST: db-shard0
       DB_SHARD1_HOST: db-shard1
@@ -75,6 +77,7 @@ services:
       DB_NAME: photoshare
       SESSION_SECRET: "xK9mL2pQ8vN4rW7zJ1yU6tA3sF0gH5d"
       PORT: 3001
+      REGION: us-east
       REDIS_HOST: redis
       REDIS_PORT: 6379
       RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
@@ -83,6 +86,83 @@ services:
     depends_on:
       - db-shard0
       - db-shard1
+    networks:
+      - photoshare-network
+
+  # EU Data Center
+  eu-app1:
+    build: .
+    container_name: photoshare-eu-app1
+    environment:
+      DB_SHARD0_HOST: db-shard0
+      DB_SHARD1_HOST: db-shard1
+      DB_USER: photoshare_user
+      DB_PASSWORD: photoshare_password
+      DB_NAME: photoshare
+      SESSION_SECRET: "xK9mL2pQ8vN4rW7zJ1yU6tA3sF0gH5d"
+      PORT: 3002
+      REGION: eu-west
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      - db-shard0
+      - db-shard1
+    networks:
+      - photoshare-network
+
+  eu-app2:
+    build: .
+    container_name: photoshare-eu-app2
+    environment:
+      DB_SHARD0_HOST: db-shard0
+      DB_SHARD1_HOST: db-shard1
+      DB_USER: photoshare_user
+      DB_PASSWORD: photoshare_password
+      DB_NAME: photoshare
+      SESSION_SECRET: "xK9mL2pQ8vN4rW7zJ1yU6tA3sF0gH5d"
+      PORT: 3003
+      REGION: eu-west
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      - db-shard0
+      - db-shard1
+    networks:
+      - photoshare-network
+
+  # US NGINX
+  us-nginx:
+    image: nginx:alpine
+    container_name: photoshare-us-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx-us.conf:/etc/nginx/nginx.conf
+      - uploads_data:/app/uploads
+    depends_on:
+      - us-app1
+      - us-app2
+    networks:
+      - photoshare-network
+
+  # EU NGINX
+  eu-nginx:
+    image: nginx:alpine
+    container_name: photoshare-eu-nginx
+    ports:
+      - "8081:80"
+    volumes:
+      - ./nginx-eu.conf:/etc/nginx/nginx.conf
+      - uploads_data:/app/uploads
+    depends_on:
+      - eu-app1
+      - eu-app2
     networks:
       - photoshare-network
 
@@ -96,20 +176,6 @@ services:
       - uploads_data:/app/uploads
     depends_on:
       - rabbitmq
-    networks:
-      - photoshare-network
-
-  nginx:
-    image: nginx:alpine
-    container_name: photoshare-nginx
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-      - uploads_data:/app/uploads
-    depends_on:
-      - app1
-      - app2
     networks:
       - photoshare-network
 
