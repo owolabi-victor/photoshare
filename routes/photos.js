@@ -1,11 +1,28 @@
 import express from 'express';
 import multer from 'multer';
 import path from 'path';
+import amqplib from 'amqplib';
 import { masterDb, slaveDb } from '../db.js';
 import authenticate from '../middleware/auth.js';
 import redis from '../redis.js';
 
 const router = express.Router();
+
+// RabbitMQ connection
+let channel;
+async function getChannel() {
+  if (channel) return channel;
+  try {
+    const connection = await amqplib.connect(process.env.RABBITMQ_URL);
+    channel = await connection.createChannel();
+    await channel.assertQueue('photo_processing', { durable: true });
+    console.log('Connected to RabbitMQ');
+    return channel;
+  } catch (error) {
+    console.error('RabbitMQ connection failed:', error.message);
+    return null;
+  }
+}
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -47,12 +64,25 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
       [req.user.id, req.file.filename, caption || null]
     );
 
-    // Invalidate feed cache so next request gets fresh data
+    // Invalidate cache
     await redis.del('feed');
     await redis.del(`user:${req.user.id}:photos`);
 
+    // Publish job to RabbitMQ
+    const ch = await getChannel();
+    if (ch) {
+      const job = { filename: req.file.filename };
+      ch.sendToQueue(
+        'photo_processing',
+        Buffer.from(JSON.stringify(job)),
+        { persistent: true }
+      );
+      console.log('Job published to queue:', job);
+    }
+
+    // Return immediately - don't wait for processing
     res.status(201).json({ 
-      message: 'Photo uploaded successfully',
+      message: 'Photo uploaded successfully. Processing in background.',
       photo: {
         filename: req.file.filename,
         caption: caption || null,
@@ -68,7 +98,6 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
 // GET ALL PHOTOS (feed)
 router.get('/feed', authenticate, async (req, res) => {
   try {
-    // Check Redis first
     const cached = await redis.get('feed');
     if (cached) {
       return res.status(200).json({ 
@@ -77,7 +106,6 @@ router.get('/feed', authenticate, async (req, res) => {
       });
     }
 
-    // Cache MISS - query the slave database
     const [rows] = await slaveDb.query(
       `SELECT photos.id, photos.filename, photos.caption, photos.created_at,
               users.username
@@ -91,12 +119,12 @@ router.get('/feed', authenticate, async (req, res) => {
       username: photo.username,
       caption: photo.caption,
       created_at: photo.created_at,
-      url: `http://localhost/uploads/${photo.filename}`
+      url: `http://localhost/uploads/${photo.filename}`,
+      thumbnail_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-thumbnail${path.extname(photo.filename)}`,
+      medium_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-medium${path.extname(photo.filename)}`
     }));
 
-    // Store in Redis with 30 second TTL
     await redis.set('feed', JSON.stringify(photos), 'EX', 30);
-
     res.status(200).json({ photos, source: 'database' });
   } catch (error) {
     console.error('Feed error:', error);
@@ -108,8 +136,6 @@ router.get('/feed', authenticate, async (req, res) => {
 router.get('/my-photos', authenticate, async (req, res) => {
   try {
     const cacheKey = `user:${req.user.id}:photos`;
-
-    // Check Redis first
     const cached = await redis.get(cacheKey);
     if (cached) {
       return res.status(200).json({ 
@@ -118,7 +144,6 @@ router.get('/my-photos', authenticate, async (req, res) => {
       });
     }
 
-    // Cache MISS - query the slave database
     const [rows] = await slaveDb.query(
       'SELECT * FROM photos WHERE user_id = ? ORDER BY created_at DESC',
       [req.user.id]
@@ -128,12 +153,12 @@ router.get('/my-photos', authenticate, async (req, res) => {
       id: photo.id,
       caption: photo.caption,
       created_at: photo.created_at,
-      url: `http://localhost/uploads/${photo.filename}`
+      url: `http://localhost/uploads/${photo.filename}`,
+      thumbnail_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-thumbnail${path.extname(photo.filename)}`,
+      medium_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-medium${path.extname(photo.filename)}`
     }));
 
-    // Store in Redis with 30 second TTL
     await redis.set(cacheKey, JSON.stringify(photos), 'EX', 30);
-
     res.status(200).json({ photos, source: 'database' });
   } catch (error) {
     console.error('My photos error:', error);

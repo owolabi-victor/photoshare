@@ -33,6 +33,28 @@ services:
     container_name: photoshare-redis
     networks:
       - photoshare-network
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: photoshare-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: password
+    ports:
+      - "15672:15672"
+    networks:
+      - photoshare-network
+  worker:
+    build: .
+    container_name: photoshare-worker
+    command: node worker.js
+    environment:
+      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      - rabbitmq
+    networks:
+      - photoshare-network
   app1:
     build: .
     container_name: photoshare-app1
@@ -48,6 +70,7 @@ services:
       PORT: 3000
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
     volumes:
       - uploads_data:/app/uploads
     depends_on:
@@ -71,6 +94,7 @@ services:
       PORT: 3001
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
     volumes:
       - uploads_data:/app/uploads
     depends_on:
