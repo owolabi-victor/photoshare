@@ -1,38 +1,36 @@
 services:
-  db-master:
+  db-shard0:
     image: mariadb:10.6
-    container_name: photoshare-db-master
+    container_name: photoshare-db-shard0
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: photoshare
       MYSQL_USER: photoshare_user
       MYSQL_PASSWORD: photoshare_password
     volumes:
-      - db_master_data:/var/lib/mysql
-      - ./mysql-config/master.cnf:/etc/mysql/conf.d/master.cnf
+      - db_shard0_data:/var/lib/mysql
     networks:
       - photoshare-network
 
-  db-slave:
+  db-shard1:
     image: mariadb:10.6
-    container_name: photoshare-db-slave
+    container_name: photoshare-db-shard1
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: photoshare
       MYSQL_USER: photoshare_user
       MYSQL_PASSWORD: photoshare_password
     volumes:
-      - db_slave_data:/var/lib/mysql
-      - ./mysql-config/slave.cnf:/etc/mysql/conf.d/slave.cnf
-    depends_on:
-      - db-master
+      - db_shard1_data:/var/lib/mysql
     networks:
       - photoshare-network
+
   redis:
     image: redis:7-alpine
     container_name: photoshare-redis
     networks:
       - photoshare-network
+
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: photoshare-rabbitmq
@@ -43,26 +41,13 @@ services:
       - "15672:15672"
     networks:
       - photoshare-network
-  worker:
-    build: .
-    container_name: photoshare-worker
-    command: node worker.js
-    environment:
-      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
-    volumes:
-      - uploads_data:/app/uploads
-    depends_on:
-      - rabbitmq
-    networks:
-      - photoshare-network
+
   app1:
     build: .
     container_name: photoshare-app1
     environment:
-      DB_MASTER_HOST: db-master
-      DB_SLAVE_HOST: db-slave
-      DB_MASTER_PORT: 3306
-      DB_SLAVE_PORT: 3306
+      DB_SHARD0_HOST: db-shard0
+      DB_SHARD1_HOST: db-shard1
       DB_USER: photoshare_user
       DB_PASSWORD: photoshare_password
       DB_NAME: photoshare
@@ -74,8 +59,8 @@ services:
     volumes:
       - uploads_data:/app/uploads
     depends_on:
-      - db-master
-      - db-slave
+      - db-shard0
+      - db-shard1
     networks:
       - photoshare-network
 
@@ -83,10 +68,8 @@ services:
     build: .
     container_name: photoshare-app2
     environment:
-      DB_MASTER_HOST: db-master
-      DB_SLAVE_HOST: db-slave
-      DB_MASTER_PORT: 3306
-      DB_SLAVE_PORT: 3306
+      DB_SHARD0_HOST: db-shard0
+      DB_SHARD1_HOST: db-shard1
       DB_USER: photoshare_user
       DB_PASSWORD: photoshare_password
       DB_NAME: photoshare
@@ -98,8 +81,21 @@ services:
     volumes:
       - uploads_data:/app/uploads
     depends_on:
-      - db-master
-      - db-slave
+      - db-shard0
+      - db-shard1
+    networks:
+      - photoshare-network
+
+  worker:
+    build: .
+    container_name: photoshare-worker
+    command: node worker.js
+    environment:
+      RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      - rabbitmq
     networks:
       - photoshare-network
 
@@ -122,6 +118,6 @@ networks:
     driver: bridge
 
 volumes:
-  db_master_data:
-  db_slave_data:
+  db_shard0_data:
+  db_shard1_data:
   uploads_data:

@@ -2,13 +2,12 @@ import express from 'express';
 import multer from 'multer';
 import path from 'path';
 import amqplib from 'amqplib';
-import { masterDb, slaveDb } from '../db.js';
+import { getShardForUser, getAllShards } from '../shardRouter.js';
 import authenticate from '../middleware/auth.js';
 import redis from '../redis.js';
 
 const router = express.Router();
 
-// RabbitMQ connection
 let channel;
 async function getChannel() {
   if (channel) return channel;
@@ -58,8 +57,9 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // Write → master
-    await masterDb.query(
+    // Write to correct shard based on user_id
+    const shard = getShardForUser(req.user.id);
+    await shard.query(
       'INSERT INTO photos (user_id, filename, caption) VALUES (?, ?, ?)',
       [req.user.id, req.file.filename, caption || null]
     );
@@ -80,13 +80,13 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
       console.log('Job published to queue:', job);
     }
 
-    // Return immediately - don't wait for processing
     res.status(201).json({ 
       message: 'Photo uploaded successfully. Processing in background.',
       photo: {
         filename: req.file.filename,
         caption: caption || null,
-        url: `http://localhost/uploads/${req.file.filename}`
+        url: `http://localhost/uploads/${req.file.filename}`,
+        shard: req.user.id % 2
       }
     });
   } catch (error) {
@@ -95,7 +95,7 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
   }
 });
 
-// GET ALL PHOTOS (feed)
+// GET ALL PHOTOS (feed) - queries all shards
 router.get('/feed', authenticate, async (req, res) => {
   try {
     const cached = await redis.get('feed');
@@ -106,33 +106,43 @@ router.get('/feed', authenticate, async (req, res) => {
       });
     }
 
-    const [rows] = await slaveDb.query(
-      `SELECT photos.id, photos.filename, photos.caption, photos.created_at,
-              users.username
-       FROM photos 
-       JOIN users ON photos.user_id = users.id
-       ORDER BY photos.created_at DESC`
+    // Fan-out query across all shards
+    const allShards = getAllShards();
+    const shardResults = await Promise.all(
+      allShards.map(shard => shard.query(
+        `SELECT photos.id, photos.filename, photos.caption, photos.created_at,
+                users.username
+         FROM photos 
+         JOIN users ON photos.user_id = users.id
+         ORDER BY photos.created_at DESC
+         LIMIT 100`
+      ))
     );
 
-    const photos = rows.map(photo => ({
-      id: photo.id,
-      username: photo.username,
-      caption: photo.caption,
-      created_at: photo.created_at,
-      url: `http://localhost/uploads/${photo.filename}`,
-      thumbnail_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-thumbnail${path.extname(photo.filename)}`,
-      medium_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-medium${path.extname(photo.filename)}`
-    }));
+    // Merge and sort results from all shards
+    const allPhotos = shardResults
+      .flatMap(([rows]) => rows)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 100)
+      .map(photo => ({
+        id: photo.id,
+        username: photo.username,
+        caption: photo.caption,
+        created_at: photo.created_at,
+        url: `http://localhost/uploads/${photo.filename}`,
+        thumbnail_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-thumbnail${path.extname(photo.filename)}`,
+        medium_url: `http://localhost/uploads/${path.basename(photo.filename, path.extname(photo.filename))}-medium${path.extname(photo.filename)}`
+      }));
 
-    await redis.set('feed', JSON.stringify(photos), 'EX', 30);
-    res.status(200).json({ photos, source: 'database' });
+    await redis.set('feed', JSON.stringify(allPhotos), 'EX', 30);
+    res.status(200).json({ photos: allPhotos, source: 'database' });
   } catch (error) {
     console.error('Feed error:', error);
     res.status(500).json({ error: 'Something went wrong' });
   }
 });
 
-// GET MY PHOTOS
+// GET MY PHOTOS - single shard query
 router.get('/my-photos', authenticate, async (req, res) => {
   try {
     const cacheKey = `user:${req.user.id}:photos`;
@@ -144,7 +154,9 @@ router.get('/my-photos', authenticate, async (req, res) => {
       });
     }
 
-    const [rows] = await slaveDb.query(
+    // Read from correct shard only
+    const shard = getShardForUser(req.user.id);
+    const [rows] = await shard.query(
       'SELECT * FROM photos WHERE user_id = ? ORDER BY created_at DESC',
       [req.user.id]
     );
