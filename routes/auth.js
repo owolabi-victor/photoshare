@@ -4,17 +4,45 @@ import { v4 as uuidv4 } from 'uuid';
 import { getShardForUser, getAllShards } from '../shardRouter.js';
 import redis from '../redis.js';
 import authenticate from '../middleware/auth.js';
+import createRateLimiter from '../middleware/rateLimiter.js';
 
 const router = express.Router();
 
+/*
+ * Rate limiter for registration — 5 attempts per hour per IP.
+ * Registration is expensive (bcrypt hashing) so we protect it
+ * aggressively. IP is used as identifier because the user has
+ * no session token yet at registration time.
+ */
+const registerLimiter = createRateLimiter({
+  capacity: 5,
+  refillRate: 5 / 3600,
+  keyPrefix: 'register',
+  identifier: (req) => req.headers['x-real-ip'] || req.ip
+});
+
+/*
+ * Rate limiter for login — 10 attempts per 15 minutes per IP.
+ * Replaces the manual Redis counter from Chapter 1.
+ * Token bucket allows an initial burst then throttles to the refill rate.
+ */
+const loginLimiter = createRateLimiter({
+  capacity: 10,
+  refillRate: 10 / 900,
+  keyPrefix: 'login',
+  identifier: (req) => req.headers['x-real-ip'] || req.ip
+});
+
 // REGISTER
-router.post('/register', async (req, res) => {
+router.post('/register', registerLimiter, async (req, res) => {
   const { username, email, password } = req.body;
 
   try {
     const password_hash = await bcrypt.hash(password, 10);
 
-    // First check if email exists across ALL shards
+    // Check if email or username exists across ALL shards before inserting.
+    // Database uniqueness constraints only work within one shard so we
+    // enforce uniqueness at the application layer.
     const allShards = getAllShards();
     for (const shard of allShards) {
       const [rows] = await shard.query(
@@ -26,7 +54,8 @@ router.post('/register', async (req, res) => {
       }
     }
 
-    // Insert into shard 0 first to get the auto-increment id
+    // Insert into shard 0 first to get the auto-increment id.
+    // We need the id before we can determine the correct shard.
     const shard0 = getShardForUser(0);
     const [result] = await shard0.query(
       'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
@@ -34,20 +63,19 @@ router.post('/register', async (req, res) => {
     );
 
     const userId = result.insertId;
-    
-    // If user belongs to shard 1, insert there instead
+
+    // If the generated id belongs to shard 1, move the record there
+    // and delete it from shard 0.
     const correctShard = getShardForUser(userId);
     if (userId % 2 !== 0) {
-      // Move to correct shard
       await correctShard.query(
         'INSERT INTO users (id, username, email, password_hash) VALUES (?, ?, ?, ?)',
         [userId, username, email, password_hash]
       );
-      // Delete from shard 0
       await shard0.query('DELETE FROM users WHERE id = ?', [userId]);
     }
 
-    res.status(201).json({ 
+    res.status(201).json({
       message: 'User registered successfully',
       shard: userId % 2
     });
@@ -58,20 +86,13 @@ router.post('/register', async (req, res) => {
 });
 
 // LOGIN
-router.post('/login', async (req, res) => {
+router.post('/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body;
-  const rateLimitKey = `ratelimit:login:${email}`;
 
   try {
-    // Check rate limit
-    const attempts = await redis.get(rateLimitKey);
-    if (attempts && parseInt(attempts) >= 5) {
-      return res.status(429).json({ 
-        error: 'Too many login attempts. Try again in 15 minutes.' 
-      });
-    }
-
-    // Search across all shards for the user
+    // Search across all shards for the user by email.
+    // We do not know which shard holds this user so we fan out
+    // across all shards and stop at the first match.
     let user = null;
     let userShard = null;
     const allShards = getAllShards();
@@ -89,30 +110,24 @@ router.post('/login', async (req, res) => {
     }
 
     if (!user) {
-      await redis.incr(rateLimitKey);
-      await redis.expire(rateLimitKey, 900);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
-      await redis.incr(rateLimitKey);
-      await redis.expire(rateLimitKey, 900);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    await redis.del(rateLimitKey);
-
     const token = uuidv4();
 
-    // Store session in correct shard
+    // Store session in the same shard as the user for data locality.
     const sessionShard = getShardForUser(user.id);
     await sessionShard.query(
       'INSERT INTO sessions (user_id, token) VALUES (?, ?)',
       [user.id, token]
     );
 
-    // Cache session in Redis
+    // Cache session in Redis so subsequent requests skip the database.
     const sessionData = {
       id: user.id,
       username: user.username,
@@ -120,7 +135,7 @@ router.post('/login', async (req, res) => {
     };
     await redis.set(`session:${token}`, JSON.stringify(sessionData), 'EX', 86400);
 
-    res.status(200).json({ 
+    res.status(200).json({
       message: 'Login successful',
       token,
       user: sessionData,
@@ -137,9 +152,11 @@ router.post('/logout', authenticate, async (req, res) => {
   const token = req.headers['authorization'];
 
   try {
+    // Delete from Redis immediately — this is what actually invalidates
+    // the session across all servers instantly.
     await redis.del(`session:${token}`);
 
-    // Delete from correct shard
+    // Delete from the correct shard for clean record keeping.
     const shard = getShardForUser(req.user.id);
     await shard.query(
       'DELETE FROM sessions WHERE token = ?',

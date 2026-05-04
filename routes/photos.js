@@ -5,8 +5,34 @@ import amqplib from 'amqplib';
 import { getShardForUser, getAllShards } from '../shardRouter.js';
 import authenticate from '../middleware/auth.js';
 import redis from '../redis.js';
+import createRateLimiter from '../middleware/rateLimiter.js';
 
 const router = express.Router();
+
+/*
+ * Rate limiter for photo uploads — 20 uploads per hour per user.
+ * We use user ID as the identifier because uploads require authentication.
+ * User ID is more precise than IP — multiple users on the same network
+ * (office, university) should not share an upload quota.
+ */
+const uploadLimiter = createRateLimiter({
+  capacity: 20,
+  refillRate: 20 / 3600,
+  keyPrefix: 'upload',
+  identifier: (req) => req.user ? req.user.id : req.headers['x-real-ip'] || req.ip
+});
+
+/*
+ * Rate limiter for feed reads — 60 requests per minute per user.
+ * The feed is cached in Redis so database load is low, but we still
+ * want to prevent a single client hammering the endpoint in a loop.
+ */
+const feedLimiter = createRateLimiter({
+  capacity: 60,
+  refillRate: 1,
+  keyPrefix: 'feed',
+  identifier: (req) => req.user ? req.user.id : req.headers['x-real-ip'] || req.ip
+});
 
 let channel;
 async function getChannel() {
@@ -49,7 +75,7 @@ const upload = multer({
 });
 
 // UPLOAD PHOTO
-router.post('/upload', authenticate, upload.single('photo'), async (req, res) => {
+router.post('/upload', authenticate, uploadLimiter, upload.single('photo'), async (req, res) => {
   const { caption } = req.body;
 
   try {
@@ -96,7 +122,7 @@ router.post('/upload', authenticate, upload.single('photo'), async (req, res) =>
 });
 
 // GET ALL PHOTOS (feed) - queries all shards
-router.get('/feed', authenticate, async (req, res) => {
+router.get('/feed', authenticate, feedLimiter, async (req, res) => {
   try {
     const cached = await redis.get('feed');
     if (cached) {
