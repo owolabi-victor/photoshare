@@ -2,6 +2,7 @@ import express from 'express';
 import dotenv from 'dotenv';
 import authRoutes from './routes/auth.js';
 import photoRoutes from './routes/photos.js';
+import redis from './redis.js';
 
 dotenv.config();
 
@@ -46,6 +47,57 @@ app.get('/', (req, res) => {
     region: REGION,
     timestamp: new Date().toISOString()
   });
+});
+
+/*
+ * Rate limit metrics endpoint — shows current token bucket state
+ * for all active rate limit keys in Redis. Used to monitor whether
+ * limits are too aggressive or too loose in production.
+ *
+ * In a real system this would be protected and consumed by a
+ * monitoring tool like Datadog or Grafana. We expose it openly
+ * here for development visibility only.
+ */
+app.get('/metrics/ratelimits', async (req, res) => {
+  try {
+    // Find all active rate limit keys in Redis
+    const keys = await redis.keys('ratelimit:*:tokens');
+
+    if (keys.length === 0) {
+      return res.status(200).json({
+        message: 'No active rate limit buckets',
+        buckets: []
+      });
+    }
+
+    // Build a report for each active bucket
+    const buckets = await Promise.all(
+      keys.map(async (tokenKey) => {
+        const tokens = await redis.get(tokenKey);
+        const ttl = await redis.ttl(tokenKey);
+
+        // Extract identifier from key format: ratelimit:{prefix}:{id}:tokens
+        const parts = tokenKey.split(':');
+        const prefix = parts[1];
+        const identifier = parts.slice(2, -1).join(':');
+
+        return {
+          prefix,
+          identifier,
+          tokens_remaining: parseFloat(tokens).toFixed(2),
+          expires_in_seconds: ttl
+        };
+      })
+    );
+
+    res.status(200).json({
+      total_active_buckets: buckets.length,
+      buckets: buckets.sort((a, b) => a.tokens_remaining - b.tokens_remaining)
+    });
+  } catch (error) {
+    console.error('Metrics error:', error.message);
+    res.status(500).json({ error: 'Could not retrieve metrics' });
+  }
 });
 
 // Detailed health check
